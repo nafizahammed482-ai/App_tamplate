@@ -1,0 +1,133 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "অ্যাপের ফোল্ডারের নাম (খালি রাখলে সব অ্যাপ)"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths: ["apps/**"]
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.pick.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: pick
+        env:
+          INPUT_APP: ${{ github.event.inputs.app }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -n "$INPUT_APP" ]; then
+            LIST="$INPUT_APP"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            LIST=$(ls apps)
+          else
+            LIST=$(git diff --name-only "$BEFORE" "$SHA" | grep "^apps/" | cut -d/ -f2 | sort -u || true)
+          fi
+          JSON=$(for a in $LIST; do [ -d "apps/$a" ] && echo "$a"; done | python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))")
+          echo "apps=$JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.apps != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.detect.outputs.apps) }}
+    env:
+      APP: ${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prepare app files
+        run: |
+          python3 - <<'EOF'
+          import json, os, shutil, zipfile
+          app = os.environ['APP']
+          d = 'apps/' + app
+          cfg = json.load(open(d + '/app.json', encoding='utf-8'))
+          shutil.rmtree('www', ignore_errors=True)
+          if os.path.exists(d + '/site.zip'):
+              os.makedirs('www')
+              zipfile.ZipFile(d + '/site.zip').extractall('www')
+              items = [i for i in os.listdir('www') if i != '__MACOSX']
+              if not os.path.exists('www/index.html') and len(items) == 1 and os.path.isdir('www/' + items[0]):
+                  top = 'www/' + items[0]
+                  for n in os.listdir(top):
+                      shutil.move(top + '/' + n, 'www/' + n)
+                  os.rmdir(top)
+          elif os.path.isdir(d + '/www'):
+              shutil.copytree(d + '/www', 'www')
+          else:
+              raise SystemExit('site.zip or www folder missing in ' + d)
+          assert os.path.exists('www/index.html'), 'index.html missing'
+          conf = {"appId": cfg["appId"], "appName": cfg["appName"], "webDir": "www",
+                  "plugins": {"SystemBars": {"initialViewportFitValueHint": "cover"}}}
+          json.dump(conf, open('capacitor.config.json', 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+          EOF
+
+      - name: Dark mode bar patch (only if the page has the theme code)
+        run: |
+          python3 - <<'EOF'
+          p = 'www/index.html'
+          s = open(p, encoding='utf-8').read()
+          old = 'sw.setAttribute("aria-checked",d==="dark")}'
+          new = 'sw.setAttribute("aria-checked",d==="dark");try{var C=window.Capacitor;if(C){window.__sb=window.__sb||(C.Plugins&&C.Plugins.SystemBars)||C.registerPlugin("SystemBars");window.__sb.setStyle({style:d==="dark"?"DARK":"LIGHT"}).catch(function(){})}}catch(e){}}'
+          if s.count(old) == 1:
+              open(p, 'w', encoding='utf-8').write(s.replace(old, new))
+              print('patched')
+          EOF
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Microphone permission (only if app.json has mic true)
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          cfg = json.load(open('apps/' + os.environ['APP'] + '/app.json', encoding='utf-8'))
+          if cfg.get('mic'):
+              p = 'android/app/src/main/AndroidManifest.xml'
+              s = open(p).read()
+              line = '<uses-permission android:name="android.permission.INTERNET" />'
+              assert line in s
+              add = line + '\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />'
+              open(p, 'w').write(s.replace(line, add))
+          EOF
+
+      - name: Sync
+        run: npx cap sync android
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app }}-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
